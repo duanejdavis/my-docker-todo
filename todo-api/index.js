@@ -22,17 +22,21 @@ const postgresClient = new Pool({
   database: envProps.postgresDatabase,
   user: envProps.postgresUser,
   password: envProps.postgresPassword,
+  max: 10,
+  idleTimeoutMillis: 30000,
 });
 postgresClient.on("connect", () => console.log("Postgres client connected"));
 postgresClient.on("error", (err) =>
   console.log("Something went wrong with Postgres: " + err)
 );
 
+// Create todo table if it doesn't exist
 postgresClient
   .query(
     "CREATE TABLE IF NOT EXISTS todo (id SERIAL PRIMARY KEY, title TEXT UNIQUE NOT NULL)"
   )
-  .catch((err) => console.log(err));
+  .then(() => console.log("Todo table ready"))
+  .catch((err) => console.log("Error creating todo table: " + err));
 
 // Redis Client Setup (v4+ compatible) /////////////////////////////////////////////////////
 const redisClient = redis.createClient({
@@ -46,6 +50,7 @@ redisClient.on("error", (err) =>
   console.log("Something went wrong with Redis: " + err)
 );
 
+// Must connect before using in v4+
 redisClient.connect().catch(console.error);
 
 // Elasticsearch Client Setup (ES 8.x compatible) ///////////////////////////////////////////////
@@ -58,11 +63,9 @@ const TODO_SEARCH_INDEX_NAME = "todos";
 // Check Elasticsearch connection and create index
 async function setupElasticsearch() {
   try {
-    // Ping to check connection
     await elasticClient.ping();
     console.log("Elasticsearch client connected");
 
-    // Create index if it doesn't exist
     const indexExists = await elasticClient.indices.exists({
       index: TODO_SEARCH_INDEX_NAME,
     });
@@ -71,12 +74,12 @@ async function setupElasticsearch() {
       await elasticClient.indices.create({
         index: TODO_SEARCH_INDEX_NAME,
       });
-      console.log("Created a new Elastic index: " + TODO_SEARCH_INDEX_NAME);
+      console.log("Created Todo index in Elasticsearch");
     } else {
-      console.log("Elastic index already exists: " + TODO_SEARCH_INDEX_NAME);
+      console.log("Todo index exists in Elasticsearch");
     }
   } catch (error) {
-    console.error("Elasticsearch setup error: " + error);
+    console.error("Something went wrong with Elasticsearch: " + error);
   }
 }
 
@@ -101,8 +104,18 @@ app.route("/api/v1/todos").get(async (req, res) => {
 
     // Nothing in cache, get from database
     const todoRows = await postgresClient.query("SELECT title FROM todo");
-    console.log("  Got todos from PostgreSQL db: ", todoRows.rows);
-    res.send(todoRows.rows);
+    const todos = todoRows.rows;
+    console.log("  Got todos from PostgreSQL db: ", todos);
+
+    // Add todos to cache for next time
+    if (todos && todos.length > 0) {
+      for (const todo of todos) {
+        await redisClient.sAdd("todos", todo.title);
+        console.log("  Adding Todo: [" + todo.title + "] to Cache");
+      }
+    }
+
+    res.send(todos);
   } catch (error) {
     console.log("Error fetching todos: " + error);
     res.status(500).send({ error: "Failed to fetch todos" });
